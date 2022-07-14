@@ -1,7 +1,11 @@
 #ifndef RB_METRICS
 #define RB_METRICS
 
-#include "common.hpp"
+#include <vector>
+#include <iostream>
+#include <thread>
+
+std::vector<unsigned int> GetAllChildren(unsigned int pid);
 
 class Rb_metrics
 {
@@ -36,29 +40,29 @@ public:
     // Network
 
     // Returns general net usage in kilobytes(read, write)
-    std::pair<unsigned long, unsigned long> GetGeneralNetUsage();
+    std::pair<unsigned long long, unsigned long long> GetGeneralNetUsage();
 
     // Returns process and its children's net usage in kilobytes(read, write)
-    std::pair<unsigned long, unsigned long> GetNetUsage();
+    std::pair<unsigned long long, unsigned long long> GetNetUsage();
 
     // Block devices
 
     // Returns general io statistics in kilobytes(read, write)
-    std::pair<unsigned long, unsigned long> GetGeneralIoStats();
+    std::pair<unsigned long long, unsigned long long> GetGeneralIoStats();
 
     // Returns process and its children's general io statistics in kilobytes(read, write)
-    std::pair<unsigned long, unsigned long> GetIoStats();
+    std::pair<unsigned long long, unsigned long long> GetIoStats();
 
 private:
     double getCpuUsage(unsigned int pid = 0);
 
     double getRamUsage(unsigned int pid = 0);
 
-    double getRamUsage_m(unsigned int pid = 0);
+    unsigned long getRamUsage_m(unsigned int pid = 0);
 
-    std::pair<unsigned long, unsigned long> getNetUsage(unsigned int pid = 0);
+    std::pair<unsigned long long, unsigned long long> getNetUsage(unsigned int pid = 0);
 
-    std::pair<unsigned long, unsigned long> getIoStats(unsigned int pid = 0);
+    std::pair<unsigned long long, unsigned long long> getIoStats(unsigned int pid = 0);
 
     unsigned int m_pid;                        // Pid of the process under examination
     unsigned long m_period;                    // Time period which data should be measured within
