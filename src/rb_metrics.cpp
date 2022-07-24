@@ -18,32 +18,39 @@
 #include <boost/algorithm/string/trim_all.hpp>
 #include <boost/algorithm/algorithm.hpp>
 
-std::string ProcStat2String(unsigned int pid);
-unsigned int GetPpidFromProcStatString(std::string procStat_string);
+// Common functions
 
-namespace system_metrics
+// Returns the ppid of provided pid
+uint32_t GetPpid(uint32_t pid)
 {
-    std::string GetActiveNetInterface();
-    unsigned long long GetSystemUptime();
-    unsigned long long GetCpuSnapshot(unsigned int pid = 0);
-    unsigned long long GetRamOccupied(unsigned int pid = 0);
-    std::pair<unsigned long long, unsigned long long> ParseNetData(unsigned int pid = 0);
-    std::pair<unsigned long long, unsigned long long> ParseIoStats(unsigned int pid = 0);
+    /*
+    /proc/[pid]/stat
+        .
+        .
+        .
+        (4) ppid  %d
+            The PID of the parent of this process.
+        .
+        .
+        .
+    */
+    uint32_t result = 0;
+    std::ifstream fin("/proc/" + std::to_string(pid) + "/stat");
+    if (fin.is_open())
+    {
+        std::string tmp;
+        for (int i = 0; i < 3; i++)
+        {
+            fin >> tmp;
+        }
+        fin >> result;
+        fin.close();
+    }
+    return result;
 }
 
-int ParseLine(char *line)
-{
-    // This assumes that a digit will be found and the line ends in " Kb".
-    int i = strlen(line);
-    const char *p = line;
-    while (*p < '0' || *p > '9')
-        p++;
-    line[i - 3] = '\0';
-    i = atoi(p);
-    return i;
-}
-
-bool Is_number(const std::string &data)
+// Returns true if <data> is number. False otherwise
+bool IsNumber(const std::string &data)
 {
     std::string::const_iterator it = data.begin();
     while (it != data.end() && std::isdigit(*it))
@@ -51,6 +58,7 @@ bool Is_number(const std::string &data)
     return !data.empty() && it == data.end();
 }
 
+// Executes comman and saves result in string
 std::string ExecCommandWithResult(const char *cmd)
 {
     std::array<char, 128> buffer;
@@ -67,21 +75,640 @@ std::string ExecCommandWithResult(const char *cmd)
     return result;
 }
 
-std::vector<unsigned int> GetAllChildren(unsigned int pid)
+// Get list of all active net interfaces
+std::vector<std::string> GetActiveNetworkInterfaces()
 {
-    boost::filesystem::path proc("/proc");
+    std::vector<std::string> result;
+    std::string cmd = "ip addr | awk '/state UP/ {print $2}' | sed 's/.$//'";
+    std::string data = ExecCommandWithResult(cmd.c_str());
+    boost::replace_all(data, "\n", " ");
+    boost::trim_all(data);
+    boost::algorithm::split(result, data, boost::algorithm::is_any_of(" "), boost::token_compress_on);
+    return result;
+}
+
+// Get list of all active block devices
+std::vector<std::string> GetActiveBlockDevices()
+{
+    std::vector<std::string> result;
+    boost::filesystem::path path("/sys/block/");
+    for (auto &entry : boost::make_iterator_range(boost::filesystem::directory_iterator(path), {}))
+    {
+        // Skip every block device that contains 'loop' in its name
+        if (entry.path().filename().string().find("loop") != std::string::npos)
+        {
+            continue;
+        }
+        result.push_back(entry.path().filename().string());
+    }
+    return result;
+}
+
+// Returns true if the net interface is active
+bool IsNetInterfaceActive(std::string net_interface)
+{
+    for (auto active_net_interface : GetActiveNetworkInterfaces())
+    {
+        if (net_interface == active_net_interface)
+            return true;
+    }
+    return false;
+}
+
+// Returns true if the block device is active
+bool IsBlockDeviceActive(std::string block_device)
+{
+    for (auto active_block_device : GetActiveBlockDevices())
+    {
+        if (block_device == active_block_device)
+            return true;
+    }
+    return false;
+}
+
+// Returns the sector size for provided block device
+uint32_t GetBlockDeviceSectorSize(std::string block_device)
+{
+    /*
+            =================
+            Queue sysfs files
+            =================
+            This text file will detail the queue files that are located in the sysfs tree
+            for each block device. Note that stacked devices typically do not export
+            any settings, since their queue merely functions as a remapping target.
+            These files are the ones found in the /sys/block/xxx/queue/ directory.
+            ...
+
+            hw_sector_size (RO)
+            -------------------
+            This is the hardware sector size of the device,
+            in bytes.
+
+            ...
+    */
+    uint32_t size;
+    std::ifstream fin("/sys//block/" + block_device + "/queue/hw_sector_size");
+    if (fin.is_open())
+    {
+        fin >> size;
+        fin.close();
+    }
+    return size;
+}
+
+// Returns true if provided pid exists
+bool ProcessExists(uint32_t pid)
+{
+    return boost::filesystem::exists("/proc/" + std::to_string(pid) + "/");
+}
+
+// Сonvert data to kilobytes
+uint32_t ToKB(uint32_t bytes)
+{
+    return bytes >> 10;
+}
+
+// Сonvert data to megabytes
+uint32_t ToMB(uint32_t bytes)
+{
+    return bytes >> 20;
+}
+
+// ===== AbstractFile ======
+
+std::string AbstractFile::GetEntryValue(Entry entry)
+{
+    if (static_cast<uint32_t>(entry) > fileContent.size())
+    {
+        return "0";
+    }
+    return fileContent[static_cast<uint32_t>(entry)];
+};
+
+bool AbstractFile::ReadFile(std::string filePath)
+{
+    std::ifstream fin(filePath);
+    if (fin.is_open())
+    {
+        std::istream_iterator<std::string> stream_start(fin);
+        std::istream_iterator<std::string> stream_end;
+        std::copy(stream_start, stream_end, std::back_inserter(fileContent));
+        fin.close();
+        return true;
+    }
+    return false;
+}
+
+// ===== ProcStatFile =====
+
+ProcStatFile::ProcStatFile(uint32_t pid)
+{
+    std::string filePath;
+    if (pid != 0)
+    {
+        filePath = "/proc/" + std::to_string(pid) + "/stat";
+    }
+    else
+    {
+        filePath = "/proc/stat";
+    }
+    if (!ReadFile(filePath))
+    {
+        return;
+    }
+}
+
+std::string ProcStatFile::GetEntryValue(Entry entry)
+{
+    if (static_cast<uint32_t>(entry) > fileContent.size())
+    {
+        return "0";
+    }
+    return fileContent[static_cast<uint32_t>(entry)];
+}
+
+// ===== ProcStatusFile =====
+
+ProcStatusFile::ProcStatusFile(uint32_t pid)
+{
+    if (pid == 0)
+        return;
+    std::string filePath;
+    filePath = "/proc/" + std::to_string(pid) + "/status";
+    if (!ReadFile(filePath))
+    {
+        return;
+    }
+}
+
+std::string ProcStatusFile::GetEntryValue(Entry entry)
+{
+    if (static_cast<uint32_t>(entry) > fileContent.size())
+    {
+        return "0";
+    }
+    return fileContent[static_cast<uint32_t>(entry)];
+}
+
+// ===== ProcMemInfoFile ======
+
+ProcMemInfoFile::ProcMemInfoFile(uint32_t pid)
+{
+    if (pid != 0)
+        return;
+    std::string filePath = "/proc/meminfo";
+    if (!ReadFile(filePath))
+    {
+        return;
+    }
+}
+
+std::string ProcMemInfoFile::GetEntryValue(Entry entry)
+{
+    if (static_cast<uint32_t>(entry) > fileContent.size())
+    {
+        return "0";
+    }
+    return fileContent[static_cast<uint32_t>(entry)];
+}
+
+// ===== ProcNetDevFile ======
+
+ProcNetDevFile::ProcNetDevFile(uint32_t pid)
+{
+    std::string filePath = "/proc";
+    if (pid != 0)
+    {
+        filePath += "/";
+        filePath += std::to_string(pid);
+    }
+
+    filePath += "/net/dev";
+    if (!ReadFile(filePath))
+    {
+        return;
+    }
+}
+
+std::string ProcNetDevFile::GetEntryValue(std::string interface_name, Entry entry)
+{
+    if (line_content_for_device.find(interface_name) == line_content_for_device.end())
+    {
+        return "0";
+    }
+    else
+    {
+        if (static_cast<uint32_t>(entry) > line_content_for_device[interface_name].size())
+        {
+            return "0";
+        }
+        return line_content_for_device[interface_name][static_cast<uint32_t>(entry)];
+    }
+}
+
+bool ProcNetDevFile::ReadFile(std::string filePath)
+{
+    std::ifstream fin(filePath);
+    std::string skip;
+    if (fin.is_open())
+    {
+        while (getline(fin, skip))
+        {
+            if (skip.find(":") != std::string::npos)
+            {
+                std::stringstream ss(skip);
+                std::string interface_name;
+
+                ss >> interface_name;
+                interface_name.erase(interface_name.length() - 1, 1); // remove ':' from the end
+                if (!IsNetInterfaceActive(interface_name))
+                {
+                    continue;
+                }
+
+                std::vector<std::string> line_content;
+
+                ss.str(skip); // reload stringstream
+                std::istream_iterator<std::string> stream_start(ss);
+                std::istream_iterator<std::string> stream_end;
+                std::copy(stream_start, stream_end, std::back_inserter(line_content));
+
+                line_content_for_device.emplace(interface_name, line_content);
+            }
+        }
+        fin.close();
+        return true;
+    }
+    return false;
+}
+
+// ===== SysBlockStatFile =====
+
+SysBlockStatFile::SysBlockStatFile(uint32_t pid)
+{
+    if (pid != 0)
+    {
+        return;
+    }
+
+    std::string filePath = "/sys/block/";
+    for (auto active_block_device : GetActiveBlockDevices())
+    {
+        filePath += active_block_device + "/stat";
+        if (!ReadFile(filePath))
+        {
+            return;
+        }
+        line_content_for_device.emplace(active_block_device, fileContent);
+    }
+}
+
+std::string SysBlockStatFile::GetEntryValue(std::string block_device, Entry entry)
+{
+    if (line_content_for_device.find(block_device) == line_content_for_device.end())
+    {
+        return "0";
+    }
+    else
+    {
+        if (static_cast<uint32_t>(entry) > line_content_for_device[block_device].size())
+        {
+            return "0";
+        }
+        return line_content_for_device[block_device][static_cast<uint32_t>(entry)];
+    }
+}
+
+// ====== ProcPidIoFile ======
+
+ProcPidIoFile::ProcPidIoFile(uint32_t pid)
+{
+    std::string filePath = "/proc/" + std::to_string(pid) + "/io";
+    if (!ReadFile(filePath))
+    {
+        return;
+    }
+}
+
+std::string ProcPidIoFile::GetEntryValue(Entry entry)
+{
+    if (static_cast<uint32_t>(entry) > fileContent.size())
+    {
+        return "0";
+    }
+    return fileContent[static_cast<uint32_t>(entry)];
+}
+
+// ===== Collector =====
+
+Collector Collect()
+{
+    return Collector();
+}
+
+cpu_stat Collector::CpuStat(uint32_t pid)
+{
+    cpu_stat cpu_data{0};
+    ProcStatFile procStatFile(0);
+    cpu_data.user = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::USER).c_str());
+    cpu_data.nice = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::NICE).c_str());
+    cpu_data.system = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::SYSTEM).c_str());
+    cpu_data.idle = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::IDLE).c_str());
+    if (pid != 0)
+    {
+        procStatFile.~ProcStatFile();
+        new (&procStatFile) ProcStatFile(pid);
+        cpu_data.utime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::UTIME).c_str());
+        cpu_data.stime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::STIME).c_str());
+        cpu_data.cutime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::CUTIME).c_str());
+        cpu_data.cstime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::CSTIME).c_str());
+    }
+    return cpu_data;
+}
+
+ram_stat Collector::RamStat(uint32_t pid)
+{
+    ram_stat ram_data{0};
+    ProcMemInfoFile procMemInfoFile;
+    ram_data.ram_available = atol(procMemInfoFile.GetEntryValue(ProcMemInfoFile::Entry::MEM_AVAILABLE).c_str());
+    ram_data.ram_total = atol(procMemInfoFile.GetEntryValue(ProcMemInfoFile::Entry::MEM_TOTAL).c_str());
+    if (pid != 0)
+    {
+        ProcStatusFile procStatusFile(pid);
+        ram_data.vmrss = atol(procStatusFile.GetEntryValue(ProcStatusFile::Entry::VMRSS).c_str());
+        ram_data.pid = pid;
+    }
+    return ram_data;
+}
+
+net_stat Collector::NetStat(uint32_t pid)
+{
+    net_stat net_data{0};
+    for (auto active_net_interface : GetActiveNetworkInterfaces())
+    {
+        ProcNetDevFile procNetDevFile(pid);
+        net_data.r_bytes += atoll(procNetDevFile.GetEntryValue(active_net_interface, ProcNetDevFile::Entry::RECV_BYTES).c_str());
+        net_data.w_bytes += atoll(procNetDevFile.GetEntryValue(active_net_interface, ProcNetDevFile::Entry::WRITE_BYTES).c_str());
+    }
+    if (pid != 0)
+    {
+        net_data.pid = pid;
+    }
+    return net_data;
+}
+
+bd_stat Collector::BdStat(uint32_t pid)
+{
+    bd_stat bd_data{0};
+    if (pid == 0)
+    {
+        for (auto active_bd : GetActiveBlockDevices())
+        {
+            bd_data.r_bytes += atoll(SysBlockStatFile().GetEntryValue(active_bd, SysBlockStatFile::Entry::READ_SECTORS).c_str());
+            bd_data.w_bytes += atoll(SysBlockStatFile().GetEntryValue(active_bd, SysBlockStatFile::Entry::WRITE_SECTORS).c_str());
+            bd_data.r_bytes *= GetBlockDeviceSectorSize(active_bd);
+            bd_data.w_bytes *= GetBlockDeviceSectorSize(active_bd);
+        }
+    }
+
+    else
+    {
+        bd_data.r_bytes += atoll(ProcPidIoFile(pid).GetEntryValue(ProcPidIoFile::Entry::RCHAR).c_str());
+        bd_data.w_bytes += atoll(ProcPidIoFile(pid).GetEntryValue(ProcPidIoFile::Entry::WCHAR).c_str());
+        bd_data.pid = pid;
+    }
+    return bd_data;
+}
+
+// ===== Calculator =====
+Calculator Calculate()
+{
+    return Calculator();
+}
+
+uint32_t Calculator::GeneralCpuUsage(cpu_stat early_cpu_data, cpu_stat lately_cpu_data)
+{
+    uint32_t result = 0;
+    if (lately_cpu_data.user < early_cpu_data.user || lately_cpu_data.nice < early_cpu_data.nice ||
+        lately_cpu_data.system < early_cpu_data.system || lately_cpu_data.idle < early_cpu_data.idle)
+    {
+        // Overflow detection. Just skip this value.
+        return result;
+    }
+
+    uint64_t total = (lately_cpu_data.user - early_cpu_data.user) +
+                     (lately_cpu_data.nice - early_cpu_data.nice) +
+                     (lately_cpu_data.system - early_cpu_data.system);
+    uint64_t total_without_idle = total;
+    total += (lately_cpu_data.idle - early_cpu_data.idle);
+    total_without_idle *= 100;
+    total_without_idle /= total;
+    result = total_without_idle;
+    return result;
+}
+
+uint32_t Calculator::CpuUsage(cpu_stat early_cpu_data, cpu_stat lately_cpu_data)
+{
+    uint32_t result = 0;
+    uint64_t total_cpu_time_before = early_cpu_data.user + early_cpu_data.nice +
+                                     early_cpu_data.system + early_cpu_data.idle;
+
+    uint64_t total_pid_time_before = early_cpu_data.utime + early_cpu_data.stime +
+                                     early_cpu_data.cutime + early_cpu_data.cstime;
+
+    uint64_t total_cpu_time_after = lately_cpu_data.user + lately_cpu_data.nice +
+                                    lately_cpu_data.system + lately_cpu_data.idle;
+
+    uint64_t total_pid_time_after = lately_cpu_data.utime + lately_cpu_data.stime +
+                                    lately_cpu_data.cutime + lately_cpu_data.cstime;
+
+    result = (total_pid_time_after - total_pid_time_before);
+    result *= 100;
+    result /= (total_cpu_time_after - total_cpu_time_before);
+    return result;
+}
+
+uint32_t Calculator::GeneralRamUsage(ram_stat ram_data)
+{
+    uint32_t occupied_ram = ram_data.ram_total - ram_data.ram_available;
+    occupied_ram *= 100;
+    occupied_ram /= ram_data.ram_total;
+    return occupied_ram;
+}
+
+uint32_t Calculator::RamUsage(ram_stat ram_data)
+{
+    uint32_t occupied_ram;
+    if (ram_data.pid != 0)
+    {
+        occupied_ram = ram_data.vmrss;
+    }
+    else
+    {
+        occupied_ram = ram_data.ram_total - ram_data.ram_available;
+    }
+    occupied_ram *= 100;
+    occupied_ram /= ram_data.ram_total;
+    return occupied_ram;
+}
+
+uint32_t Calculator::GeneralRamUsage_m(ram_stat ram_data)
+{
+    uint32_t occupied_ram = ram_data.ram_total - ram_data.ram_available;
+    // occupied_ram /= 1024;
+    return ToMB(occupied_ram * 1024); // kbytes > bytes
+}
+
+uint32_t Calculator::RamUsage_m(ram_stat ram_data)
+{
+    uint32_t occupied_ram = ram_data.vmrss;
+    occupied_ram /= 1024;
+    return occupied_ram;
+}
+
+uint32_t Calculator::NetDownload(net_stat early_net_data, net_stat lately_net_data)
+{
+    return lately_net_data.r_bytes - early_net_data.r_bytes;
+}
+
+uint32_t Calculator::NetUpload(net_stat early_net_data, net_stat lately_net_data)
+{
+    return lately_net_data.w_bytes - early_net_data.w_bytes;
+}
+
+uint32_t Calculator::BlockDeviceWrite(bd_stat early_bd_data, bd_stat lately_bd_data)
+{
+    return lately_bd_data.w_bytes - early_bd_data.w_bytes;
+}
+
+uint32_t Calculator::BlockDeviceRead(bd_stat early_bd_data, bd_stat lately_bd_data)
+{
+    return lately_bd_data.r_bytes - early_bd_data.r_bytes;
+}
+
+uint32_t Rb_metrics::GetGeneralCpuUsage()
+{
+    return getCpuUsage(0);
+}
+
+uint32_t Rb_metrics::GetCpuUsage()
+{
+    return getCpuUsage(m_pid);
+}
+
+uint32_t Rb_metrics::GetGeneralRamUsage()
+{
+    return getRamUsage();
+}
+
+uint32_t Rb_metrics::GetRamUsage()
+{
+    return getRamUsage(m_pid);
+}
+
+uint32_t Rb_metrics::GetGeneralRamUsage_m()
+{
+    return getRamUsage_m();
+}
+
+uint32_t Rb_metrics::GetRamUsage_m()
+{
+    return getRamUsage_m(m_pid);
+}
+
+std::pair<uint64_t, uint64_t> Rb_metrics::GetGeneralNetUsage()
+{
+    return getNetUsage();
+}
+
+std::pair<uint64_t, uint64_t> Rb_metrics::GetNetUsage()
+{
+    return getNetUsage(m_pid);
+}
+
+std::pair<uint64_t, uint64_t> Rb_metrics::GetGeneralIoStats()
+{
+    return getIoStats();
+}
+
+std::pair<uint64_t, uint64_t> Rb_metrics::GetIoStats()
+{
+    return getIoStats(m_pid);
+}
+
+uint32_t Rb_metrics::getCpuUsage(unsigned int pid) // = 0
+{
+    if (pid != 0 && !ProcessExists(pid))
+    {
+        // Log >> <pid> does not exist
+        return 0;
+    }
+    auto early_cpu_data = Collect().CpuStat(pid);
+    std::this_thread::sleep_for(std::chrono::seconds(m_period));
+    auto lately_cpu_data = Collect().CpuStat(pid);
+    if (pid == 0) {
+        return Calculate().GeneralCpuUsage(early_cpu_data, lately_cpu_data);
+    }
+    return Calculate().CpuUsage(early_cpu_data, lately_cpu_data);
+}
+
+uint32_t Rb_metrics::getRamUsage(unsigned int pid) // = 0
+{
+    if (pid != 0 && !ProcessExists(pid))
+    {
+        // Log >> <pid> does not exist
+        return 0;
+    }
+    auto ram_data = Collect().RamStat(pid);
+    return Calculate().RamUsage(ram_data);
+}
+
+uint32_t Rb_metrics::getRamUsage_m(uint32_t pid) // = 0
+{
+    if (pid != 0 && !ProcessExists(pid))
+    {
+        // Log >> <pid> does not exist
+        return 0;
+    }
+    auto ram_data = Collect().RamStat(pid);
+    return ToMB(Calculate().RamUsage(ram_data) * 1024); // kb >> bytes
+}
+
+std::pair<uint64_t, uint64_t> Rb_metrics::getNetUsage(uint32_t pid) // = 0
+{
+    std::pair<uint64_t, uint64_t> result;
+    auto early_network_usage_data = Collect().NetStat(pid);
+    std::this_thread::sleep_for(std::chrono::seconds(m_period));
+    auto lately_network_usage_data = Collect().NetStat(pid);
+    result.first = ToKB(Calculate().NetDownload(early_network_usage_data, lately_network_usage_data));
+    result.second = ToKB(Calculate().NetUpload(early_network_usage_data, lately_network_usage_data));
+    return result;
+}
+
+std::pair<uint64_t, uint64_t> Rb_metrics::getIoStats(uint32_t pid) // = 0
+{
+    std::pair<uint64_t, uint64_t> result;
+    auto early_bd_usage_data = Collect().BdStat(pid);
+    std::this_thread::sleep_for(std::chrono::milliseconds(m_period));
+    auto lately_bd_usage_data = Collect().BdStat(pid);
+    result.first = ToKB(Calculate().BlockDeviceRead(early_bd_usage_data, lately_bd_usage_data));
+    result.second = ToKB(Calculate().BlockDeviceWrite(early_bd_usage_data, lately_bd_usage_data));
+    return result;
+}
+
+std::vector<uint32_t> Rb_metrics::getAllChildren(uint32_t pid)
+{
     std::vector<unsigned int> result;
     unsigned proc_count = 0;
-    if (boost::filesystem::is_directory(proc))
+    if (boost::filesystem::is_directory("/proc"))
     {
-        for (auto &entry : boost::make_iterator_range(boost::filesystem::directory_iterator(proc), {}))
+        for (auto &entry : boost::make_iterator_range(boost::filesystem::directory_iterator("/proc"), {}))
         {
             boost::filesystem::path tmp(entry);
-            if (Is_number(tmp.filename().string()))
+            if (IsNumber(tmp.filename().string()))
             {
-                unsigned int curr_pid = atoll(tmp.filename().string().c_str());
-                std::string statData = ProcStat2String(curr_pid);
-                unsigned int ppid = GetPpidFromProcStatString(statData);
+                uint32_t curr_pid = atoi(tmp.filename().string().c_str());
+                uint32_t ppid = GetPpid(curr_pid);
                 if (ppid == pid)
                 {
                     result.push_back(curr_pid);
@@ -89,586 +716,5 @@ std::vector<unsigned int> GetAllChildren(unsigned int pid)
             }
         }
     }
-    return result;
-}
-
-std::string ProcStat2String(unsigned int pid)
-{
-    std::string result;
-    std::string path = "/proc/";
-    path += std::to_string(pid);
-    path += "/stat";
-
-    std::ifstream fopen(path);
-    if (fopen.is_open())
-    {
-        while (!fopen.eof())
-        {
-            std::string tmp_str;
-            fopen >> tmp_str;
-            result += tmp_str + " ";
-        }
-        fopen.close();
-    }
-    return result;
-}
-
-unsigned int GetPpidFromProcStatString(std::string procStat_string)
-{
-    if (procStat_string.empty())
-    {
-        return 0;
-    }
-
-    std::stringstream ss(procStat_string);
-
-    unsigned int ppid;
-    std::string tmp;
-    ss >> tmp;
-    ss >> tmp;
-    ss >> tmp;
-    ss >> tmp;
-    ppid = atoll(tmp.c_str());
-    return ppid;
-}
-
-namespace system_metrics
-{
-    unsigned long long GetSystemUptime()
-    {
-        std::ifstream fin("/proc/uptime");
-        unsigned long long result;
-        if (fin.is_open())
-        {
-            fin >> result;
-        }
-        fin.close();
-        return result;
-    }
-    unsigned long long GetCpuSnapshot(unsigned int pid)
-    {
-        std::string path = "/proc";
-        if (pid == 0)
-        {
-            path += "/stat";
-        }
-        else
-        {
-            path += "/" + std::to_string(pid) + "/stat";
-        }
-        unsigned long long totalUser = 0, totalUserLow = 0, totalSys = 0, totalIdle = 0, total = 0;
-        std::ifstream fin(path);
-        if (fin.is_open())
-        {
-            if (pid == 0)
-            {
-                std::string tmp;
-                fin >> tmp; // cpu
-
-                fin >> tmp;
-                totalUser = atoll(tmp.c_str());
-
-                fin >> tmp;
-                totalUserLow = atoll(tmp.c_str());
-
-                fin >> tmp;
-                totalSys = atoll(tmp.c_str());
-
-                fin >> tmp;
-                totalIdle = atoll(tmp.c_str());
-            }
-            else
-            {
-                std::string tmp;
-                for (int i = 0; i < 13; i++)
-                {
-                    fin >> tmp;
-                }
-                fin >> tmp; // utime
-                totalUser = atoll(tmp.c_str());
-
-                fin >> tmp; // stime
-                totalUserLow = atoll(tmp.c_str());
-
-                fin >> tmp; // cutime
-                totalSys = atoll(tmp.c_str());
-
-                fin >> tmp; // cstime
-                totalIdle = atoll(tmp.c_str());
-            }
-            fin.close();
-        }
-        total = totalUser + totalUserLow + totalSys + totalIdle;
-        return total;
-    }
-
-    unsigned long long GetRamTotal()
-    {
-        std::ifstream meminfo("/proc/meminfo");
-        std::string line;
-
-        unsigned long long memTotal = 0;
-
-        if (meminfo.is_open())
-        {
-            while (std::getline(meminfo, line))
-            {
-                if (line.find("MemTotal") != std::string::npos)
-                {
-                    std::stringstream ss(line);
-                    std::string value;
-                    ss >> value;
-                    ss >> memTotal;
-                    break;
-                }
-            }
-            meminfo.close();
-        }
-        return memTotal;
-    }
-
-    unsigned long long GetRamAvailable()
-    {
-        std::ifstream meminfo("/proc/meminfo");
-        std::string line;
-        unsigned long long memAvailable = 0;
-        if (meminfo.is_open())
-        {
-            while (std::getline(meminfo, line))
-            {
-                if (line.find("MemAvailable") != std::string::npos)
-                {
-                    std::stringstream ss(line);
-                    std::string value;
-                    ss >> value;
-                    ss >> memAvailable;
-                    break;
-                }
-            }
-            meminfo.close();
-        }
-        return memAvailable;
-    }
-
-    // How many ram occupied by process
-    unsigned long long GetRamOccupied(unsigned int pid)
-    {
-        unsigned long long result = 0;
-        if (pid == 0)
-        {
-            auto memTotal = system_metrics::GetRamTotal();
-            auto memAvail = system_metrics::GetRamAvailable();
-            result = memTotal - memAvail;
-        }
-        else
-        {
-            unsigned long long ramOccupied;
-            std::ifstream fin("/proc/" + std::to_string(pid) + "/status");
-            if (fin.is_open())
-            {
-                std::string tmp;
-                while (!fin.eof())
-                {
-                    fin >> tmp;
-                    if (tmp != "VmRSS:")
-                        continue;
-
-                    fin >> tmp;
-                    ramOccupied = atoll(tmp.c_str());
-                    break;
-                }
-                fin.close();
-            }
-            result = ramOccupied;
-        }
-        return result;
-    }
-
-    std::string GetActiveNetInterface()
-    {
-        std::string cmd = "ip addr | awk '/state UP/ {print $2}' | sed 's/.$//'";
-        std::array<char, 128> buffer;
-        std::string result;
-        std::unique_ptr<FILE, decltype(&pclose)> pipe(popen(cmd.c_str(), "r"), pclose);
-        if (!pipe)
-        {
-            throw std::runtime_error("popen() failed!");
-        }
-        while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr)
-        {
-            result += buffer.data();
-        }
-        boost::trim_all(result);
-        return result;
-    }
-
-    std::pair<unsigned long long, unsigned long long> ParseNetData(unsigned int pid)
-{
-    std::pair<unsigned long long, unsigned long long> result{0, 0};
-    std::string path = "/proc";
-    if (pid == 0)
-    {
-        path += "/net/dev";
-    }
-    else
-    {
-        path += "/" + std::to_string(pid) + "/net/dev";
-    }
-
-    std::ifstream fin(path);
-    if (fin.is_open())
-    {
-        std::string tmp;
-        while (fin >> tmp)
-        {
-            // Just skip useless lines
-            if (tmp.find_first_of(":") != std::string::npos)
-            {
-                tmp.erase(tmp.length() - 1, 1);
-
-                if (tmp != system_metrics::GetActiveNetInterface())
-                    continue;
-
-                // tmp contains name of the device
-
-                fin >> tmp;
-                result.first += static_cast<unsigned long long>(atoll(tmp.c_str()));
-
-                for (int i = 0; i < 7; i++)
-                {
-                    fin >> tmp;
-                }
-
-                fin >> tmp;
-                result.second += static_cast<unsigned long long>(atoll(tmp.c_str()));
-            }
-        }
-    }
-    return result;
-}
-
-    std::pair<unsigned long long, unsigned long long> ParseIoStats(unsigned int pid)
-    {
-        std::pair<unsigned long long, unsigned long long> result;
-
-        if (pid == 0)
-        {
-            // Get general io stats
-            boost::filesystem::path path("/sys/block/");
-            std::vector<std::string> block_devices;
-            for (auto &entry : boost::make_iterator_range(boost::filesystem::directory_iterator(path), {}))
-            {
-                if (entry.path().filename().string().find("loop") != std::string::npos)
-                {
-                    continue;
-                }
-                block_devices.push_back(entry.path().filename().string());
-            }
-
-            for (auto &block_device : block_devices)
-            {
-                boost::filesystem::path tmp_path(path.string() + "/" + block_device + "/stat");
-                if (boost::filesystem::is_regular_file(tmp_path))
-                {
-                    std::ifstream fin(tmp_path.string());
-                    if (fin.is_open())
-                    {
-                        // field 3 - read sectors
-                        // field 7 - write sectors
-                        std::string tmp;
-                        for (int i = 0; i < 2; i++)
-                        {
-                            fin >> tmp;
-                        }
-                        fin >> tmp;
-                        result.first += atoll(tmp.c_str());
-
-                        for (int i = 0; i < 3; i++)
-                        {
-                            fin >> tmp;
-                        }
-                        fin >> tmp;
-                        result.second += atoll(tmp.c_str());
-                        fin.close();
-                    }
-                }
-            }
-
-            result.second *= 512;
-            result.first *= 512;
-
-            result.second /= 1024;
-            result.first /= 1024;
-        }
-
-        else
-        {
-            boost::filesystem::path tmp_path("/proc/" + std::to_string(pid) + "/io");
-            if (boost::filesystem::is_regular_file(tmp_path))
-            {
-                std::ifstream fin(tmp_path.string().c_str());
-                if (fin.is_open())
-                {
-                    std::string tmp;
-                    fin >> tmp; // rchar:
-                    fin >> tmp;
-                    result.first += atoll(tmp.c_str());
-
-                    fin >> tmp; // wchar:
-                    fin >> tmp;
-                    result.second += atoll(tmp.c_str());
-                }
-            }
-            // add children branch
-            // sum their values
-            result.first /= 1024;
-            result.second /= 1024;
-        }
-        return result;
-    }
-
-}
-
-Rb_metrics::~Rb_metrics()
-{
-}
-
-double Rb_metrics::GetGeneralCpuUsage()
-{
-    double result = getCpuUsage();
-    return result;
-}
-
-double Rb_metrics::GetCpuUsage()
-{
-    double result = getCpuUsage(m_pid);
-    return result;
-}
-
-double Rb_metrics::GetGeneralRamUsage()
-{
-    double result = getRamUsage();
-    return result;
-}
-
-double Rb_metrics::GetRamUsage()
-{
-    double result = getRamUsage(m_pid);
-    return result;
-}
-
-unsigned long Rb_metrics::GetGeneralRamUsage_m()
-{
-    unsigned long result = getRamUsage_m();
-    return result;
-}
-
-unsigned long Rb_metrics::GetRamUsage_m()
-{
-    unsigned long result = getRamUsage_m(m_pid);
-    return result;
-}
-
-std::pair<unsigned long long, unsigned long long> Rb_metrics::GetGeneralNetUsage()
-{
-    auto result = getNetUsage();
-    return result;
-}
-
-std::pair<unsigned long long, unsigned long long> Rb_metrics::GetNetUsage()
-{
-    auto result = getNetUsage(m_pid);
-    return result;
-}
-
-std::pair<unsigned long long, unsigned long long> Rb_metrics::GetGeneralIoStats()
-{
-    auto result = getIoStats();
-    return result;
-}
-
-std::pair<unsigned long long, unsigned long long> Rb_metrics::GetIoStats()
-{
-    auto result = getIoStats(m_pid);
-    return result;
-}
-
-double Rb_metrics::getCpuUsage(unsigned int pid) // = 0
-{
-    double result = 0.00;
-    if (pid == 0)
-    {
-        unsigned long long last_totalUser, last_totalUserLow, last_totalSys, last_totalIdle, last_total;
-        std::ifstream fin("/proc/stat");
-        if (fin.is_open())
-        {
-            std::string tmp;
-            fin >> tmp; // cpu
-            fin >> last_totalUser;
-            fin >> last_totalUserLow;
-            fin >> last_totalSys;
-            fin >> last_totalIdle;
-            fin.close();
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(m_period));
-
-        unsigned long long totalUser, totalUserLow, totalSys, totalIdle, total;
-        fin.open("/proc/stat");
-        if (fin.is_open())
-        {
-            std::string tmp;
-            fin >> tmp;
-            fin >> totalUser;
-            fin >> totalUserLow;
-            fin >> totalSys;
-            fin >> totalIdle;
-            fin.close();
-        }
-
-        if (totalUser < last_totalUser || totalUserLow < last_totalUserLow ||
-            totalSys < last_totalSys || totalIdle < last_totalIdle)
-        {
-            // Overflow detection. Just skip this value.
-            result = -1.0;
-            return result;
-        }
-        total = (totalUser - last_totalUser) + (totalUserLow - last_totalUserLow) +
-                (totalSys - last_totalSys);
-        result = total;
-        total += (totalIdle - last_totalIdle);
-        result *= 100;
-        result /= total;
-    }
-
-    else
-    {
-        auto totalTime1 = system_metrics::GetCpuSnapshot();
-        auto procTime1 = system_metrics::GetCpuSnapshot(pid);
-        // plus kid times
-
-        std::this_thread::sleep_for(std::chrono::seconds(m_period));
-
-        auto totalTime2 = system_metrics::GetCpuSnapshot();
-        auto procTime2 = system_metrics::GetCpuSnapshot(pid);
-        // plus kid times
-
-        result += 100 * (procTime2 - procTime1);
-        result /= (totalTime2 - totalTime1);
-    }
-    return result;
-}
-
-double Rb_metrics::getRamUsage(unsigned int pid) // = 0
-{
-    double result = 0;
-    std::this_thread::sleep_for(std::chrono::seconds(m_period));
-    auto totalRam = system_metrics::GetRamTotal();
-    unsigned long long occRam = 0;
-    if (pid == 0)
-    {
-        occRam = system_metrics::GetRamOccupied();
-    }
-    else
-    {
-        occRam = system_metrics::GetRamOccupied(pid);
-    }
-    result += (occRam * 100);
-    result /= totalRam;
-    return result;
-}
-
-unsigned long Rb_metrics::getRamUsage_m(unsigned int pid) // = 0
-{
-    unsigned long result = 0;
-    std::this_thread::sleep_for(std::chrono::seconds(m_period));
-    if (pid == 0)
-    {
-        result = system_metrics::GetRamOccupied();
-    }
-    else
-    {
-        result = system_metrics::GetRamOccupied(pid);
-    }
-    result /= 1024;
-    return result;
-}
-
-std::pair<unsigned long long, unsigned long long> Rb_metrics::getNetUsage(unsigned int pid) // = 0
-{
-    std::pair<unsigned long, unsigned long> result{0, 0};
-    if (pid == 0)
-    {
-        auto tmp = system_metrics::ParseNetData();
-        std::this_thread::sleep_for(std::chrono::seconds(m_period));
-        result = system_metrics::ParseNetData();
-        result.first -= tmp.first;
-        result.second -= tmp.second;
-    }
-    else
-    {
-        auto tmp = system_metrics::ParseNetData(pid);
-        // Collect children data
-        for (auto kid : m_children_pids)
-        {
-            auto inner_tmp = system_metrics::ParseNetData(kid);
-            tmp.first += inner_tmp.first;
-            tmp.second += inner_tmp.second;
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(m_period));
-
-        result = system_metrics::ParseNetData(pid);
-        for (auto kid : m_children_pids)
-        {
-            auto inner_tmp = system_metrics::ParseNetData(kid);
-            result.first += inner_tmp.first;
-            result.second += inner_tmp.second;
-        }
-
-        result.first -= tmp.first;
-        result.second -= tmp.second;
-    }
-    result.first /= 1024;
-    result.second /= 1024;
-    return result;
-}
-
-std::pair<unsigned long long, unsigned long long> Rb_metrics::getIoStats(unsigned int pid) // = 0
-{
-    std::pair<unsigned long, unsigned long> result{0, 0};
-    if (pid == 0)
-    {
-        auto tmp = system_metrics::ParseIoStats();
-
-        std::this_thread::sleep_for(std::chrono::seconds(m_period));
-
-        result = system_metrics::ParseIoStats();
-        result.first -= tmp.first;
-        result.second -= tmp.second;
-    }
-    else
-    {
-        auto tmp = system_metrics::ParseIoStats(pid);
-        for (auto kid : m_children_pids)
-        {
-            auto inner_tmp = system_metrics::ParseIoStats(kid);
-            tmp.first += inner_tmp.first;
-            tmp.second += inner_tmp.second;
-        }
-
-        std::this_thread::sleep_for(std::chrono::seconds(m_period));
-        result = system_metrics::ParseIoStats(pid);
-        for (auto kid : m_children_pids)
-        {
-            auto inner_tmp = system_metrics::ParseIoStats(kid);
-            result.first += inner_tmp.first;
-            result.second += inner_tmp.second;
-        }
-
-        result.first -= tmp.first;
-        result.second -= tmp.second;
-    }
-
     return result;
 }
