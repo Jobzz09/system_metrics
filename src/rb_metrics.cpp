@@ -23,30 +23,27 @@
 // Returns the ppid of provided pid
 uint32_t GetPpid(uint32_t pid)
 {
-    /*
-    /proc/[pid]/stat
-        .
-        .
-        .
-        (4) ppid  %d
-            The PID of the parent of this process.
-        .
-        .
-        .
-    */
-    uint32_t result = 0;
-    std::ifstream fin("/proc/" + std::to_string(pid) + "/stat");
-    if (fin.is_open())
+    std::string ppid;
+
+    ProcStatFile procStatFile(pid);
+    if (procStatFile.GetLastError() != ProcStatFile::Result::ERROR)
     {
-        std::string tmp;
-        for (int i = 0; i < 3; i++)
+        if (procStatFile.GetEntryValue(ProcStatFile::Entry::PPID, ppid) == ProcStatFile::Result::ERROR)
         {
-            fin >> tmp;
+            // error getting ppid entry value for pid
+            //  log << error occured: error cause << endl;
+            // log << "Cannot read /proc/" << pid << "/stat file. Error occured" << std::endl;"
+
+            return 0;
         }
-        fin >> result;
-        fin.close();
     }
-    return result;
+    else
+    {
+        // Error while reading ProcStat file for pid
+        // log << error occured << endl;
+        return 0;
+    }
+    return atol(ppid.c_str());
 }
 
 // Returns true if <data> is number. False otherwise
@@ -114,18 +111,6 @@ bool IsNetInterfaceActive(std::string net_interface)
     }
     return false;
 }
-
-// Returns true if the block device is active
-bool IsBlockDeviceActive(std::string block_device)
-{
-    for (auto active_block_device : GetActiveBlockDevices())
-    {
-        if (block_device == active_block_device)
-            return true;
-    }
-    return false;
-}
-
 // Returns the sector size for provided block device
 uint32_t GetBlockDeviceSectorSize(std::string block_device)
 {
@@ -147,7 +132,7 @@ uint32_t GetBlockDeviceSectorSize(std::string block_device)
             ...
     */
     uint32_t size;
-    std::ifstream fin("/sys//block/" + block_device + "/queue/hw_sector_size");
+    std::ifstream fin("/sys/block/" + block_device + "/queue/hw_sector_size");
     if (fin.is_open())
     {
         fin >> size;
@@ -162,30 +147,37 @@ bool ProcessExists(uint32_t pid)
     return boost::filesystem::exists("/proc/" + std::to_string(pid) + "/");
 }
 
-// Сonvert data to kilobytes
-uint32_t ToKB(uint32_t bytes)
+// Сonvert data in kilobytes to kilobytes
+uint32_t ToKB(uint64_t bytes)
 {
     return bytes >> 10;
 }
 
-// Сonvert data to megabytes
-uint32_t ToMB(uint32_t bytes)
+// Сonvert data in bytes to megabytes
+uint32_t ToMB(uint64_t bytes)
 {
     return bytes >> 20;
 }
 
 // ===== AbstractFile ======
 
-std::string AbstractFile::GetEntryValue(Entry entry)
+AbstractFile::Result AbstractFile::GetLastError()
+{
+    return last_error;
+}
+
+AbstractFile::Result AbstractFile::GetEntryValue(Entry entry, std::string &dst_string)
 {
     if (static_cast<uint32_t>(entry) > fileContent.size())
     {
-        return "0";
+        // log << "Attempt to step outside file content"
+        return Result::ERROR;
     }
-    return fileContent[static_cast<uint32_t>(entry)];
+    dst_string = fileContent[static_cast<uint32_t>(entry)];
+    return Result::SUCCESS;
 };
 
-bool AbstractFile::ReadFile(std::string filePath)
+AbstractFile::Result AbstractFile::ReadFile(std::string &&filePath)
 {
     std::ifstream fin(filePath);
     if (fin.is_open())
@@ -194,9 +186,9 @@ bool AbstractFile::ReadFile(std::string filePath)
         std::istream_iterator<std::string> stream_end;
         std::copy(stream_start, stream_end, std::back_inserter(fileContent));
         fin.close();
-        return true;
+        return Result::SUCCESS;
     }
-    return false;
+    return Result::ERROR;
 }
 
 // ===== ProcStatFile =====
@@ -212,19 +204,21 @@ ProcStatFile::ProcStatFile(uint32_t pid)
     {
         filePath = "/proc/stat";
     }
-    if (!ReadFile(filePath))
+    if (ReadFile(std::move(filePath)) == Result::ERROR)
     {
-        return;
+        last_error = Result::ERROR;
     }
 }
 
-std::string ProcStatFile::GetEntryValue(Entry entry)
+AbstractFile::Result ProcStatFile::GetEntryValue(Entry entry, std::string &dst_string)
 {
     if (static_cast<uint32_t>(entry) > fileContent.size())
     {
-        return "0";
+        // log << "Attempt to step outside file content"
+        return Result::ERROR;
     }
-    return fileContent[static_cast<uint32_t>(entry)];
+    dst_string = fileContent[static_cast<uint32_t>(entry)];
+    return Result::SUCCESS;
 }
 
 // ===== ProcStatusFile =====
@@ -235,19 +229,22 @@ ProcStatusFile::ProcStatusFile(uint32_t pid)
         return;
     std::string filePath;
     filePath = "/proc/" + std::to_string(pid) + "/status";
-    if (!ReadFile(filePath))
+    if (ReadFile(std::move(filePath)) == ProcStatusFile::Result::ERROR)
     {
+        last_error = Result::ERROR;
         return;
     }
 }
 
-std::string ProcStatusFile::GetEntryValue(Entry entry)
+AbstractFile::Result ProcStatusFile::GetEntryValue(Entry entry, std::string &dst_string)
 {
     if (static_cast<uint32_t>(entry) > fileContent.size())
     {
-        return "0";
+        // log << "Attempt to step outside file content"
+        return Result::ERROR;
     }
-    return fileContent[static_cast<uint32_t>(entry)];
+    dst_string = fileContent[static_cast<uint32_t>(entry)];
+    return Result::SUCCESS;
 }
 
 // ===== ProcMemInfoFile ======
@@ -255,21 +252,27 @@ std::string ProcStatusFile::GetEntryValue(Entry entry)
 ProcMemInfoFile::ProcMemInfoFile(uint32_t pid)
 {
     if (pid != 0)
-        return;
-    std::string filePath = "/proc/meminfo";
-    if (!ReadFile(filePath))
     {
+        last_error = Result::ERROR;
+        return;
+    }
+
+    if (ReadFile("/proc/meminfo") == Result::ERROR)
+    {
+        last_error = Result::ERROR;
         return;
     }
 }
 
-std::string ProcMemInfoFile::GetEntryValue(Entry entry)
+AbstractFile::Result ProcMemInfoFile::GetEntryValue(Entry entry, std::string &dst_string)
 {
     if (static_cast<uint32_t>(entry) > fileContent.size())
     {
-        return "0";
+        // log << "Attempt to step outside file content"
+        return Result::ERROR;
     }
-    return fileContent[static_cast<uint32_t>(entry)];
+    dst_string = fileContent[static_cast<uint32_t>(entry)];
+    return Result::SUCCESS;
 }
 
 // ===== ProcNetDevFile ======
@@ -284,29 +287,33 @@ ProcNetDevFile::ProcNetDevFile(uint32_t pid)
     }
 
     filePath += "/net/dev";
-    if (!ReadFile(filePath))
+    if (ReadFile(std::move(filePath)) == Result::ERROR)
     {
+        last_error = Result::ERROR;
         return;
     }
 }
 
-std::string ProcNetDevFile::GetEntryValue(std::string interface_name, Entry entry)
+AbstractFile::Result ProcNetDevFile::GetEntryValue(const std::string &interface_name, Entry entry, std::string &dst_string)
 {
     if (line_content_for_device.find(interface_name) == line_content_for_device.end())
     {
-        return "0";
+        // log << "interface " << interface_name << " wasn't found in /proc/net/dev file"
+        return Result::ERROR;
     }
     else
     {
         if (static_cast<uint32_t>(entry) > line_content_for_device[interface_name].size())
         {
-            return "0";
+            // log << "Attempt to step outside file content"
+            return Result::ERROR;
         }
-        return line_content_for_device[interface_name][static_cast<uint32_t>(entry)];
+        dst_string = line_content_for_device[interface_name][static_cast<uint32_t>(entry)];
+        return Result::SUCCESS;
     }
 }
 
-bool ProcNetDevFile::ReadFile(std::string filePath)
+AbstractFile::Result ProcNetDevFile::ReadFile(std::string &&filePath)
 {
     std::ifstream fin(filePath);
     std::string skip;
@@ -337,9 +344,10 @@ bool ProcNetDevFile::ReadFile(std::string filePath)
             }
         }
         fin.close();
-        return true;
+        return Result::SUCCESS;
     }
-    return false;
+    last_error = Result::ERROR;
+    return Result::ERROR;
 }
 
 // ===== SysBlockStatFile =====
@@ -355,27 +363,31 @@ SysBlockStatFile::SysBlockStatFile(uint32_t pid)
     for (auto active_block_device : GetActiveBlockDevices())
     {
         filePath += active_block_device + "/stat";
-        if (!ReadFile(filePath))
+        if (ReadFile(std::move(filePath)) == Result::ERROR)
         {
+            last_error = Result::ERROR;
             return;
         }
         line_content_for_device.emplace(active_block_device, fileContent);
     }
 }
 
-std::string SysBlockStatFile::GetEntryValue(std::string block_device, Entry entry)
+AbstractFile::Result SysBlockStatFile::GetEntryValue(const std::string &block_device, Entry entry, std::string &dst_string)
 {
     if (line_content_for_device.find(block_device) == line_content_for_device.end())
     {
-        return "0";
+        // log << "block_device " << block_device << " wasn't found in /sys/block file"
+        return Result::ERROR;
     }
     else
     {
         if (static_cast<uint32_t>(entry) > line_content_for_device[block_device].size())
         {
-            return "0";
+            // log << "Attempt to step outside file content"
+            return Result::ERROR;
         }
-        return line_content_for_device[block_device][static_cast<uint32_t>(entry)];
+        dst_string = line_content_for_device[block_device][static_cast<uint32_t>(entry)];
+        return Result::SUCCESS;
     }
 }
 
@@ -383,46 +395,121 @@ std::string SysBlockStatFile::GetEntryValue(std::string block_device, Entry entr
 
 ProcPidIoFile::ProcPidIoFile(uint32_t pid)
 {
-    std::string filePath = "/proc/" + std::to_string(pid) + "/io";
-    if (!ReadFile(filePath))
+    if (ReadFile("/proc/" + std::to_string(pid) + "/io") == Result::ERROR)
     {
+        last_error = Result::ERROR;
         return;
     }
 }
 
-std::string ProcPidIoFile::GetEntryValue(Entry entry)
+AbstractFile::Result ProcPidIoFile::GetEntryValue(Entry entry, std::string &dst_string)
 {
     if (static_cast<uint32_t>(entry) > fileContent.size())
     {
-        return "0";
+        // log << "block_device " << block_device << " wasn't found in /sys/block file"
+        return Result::ERROR;
     }
-    return fileContent[static_cast<uint32_t>(entry)];
+    dst_string = fileContent[static_cast<uint32_t>(entry)];
+    return Result::SUCCESS;
 }
 
 // ===== Collector =====
 
-Collector Collect()
-{
-    return Collector();
-}
-
 cpu_stat Collector::CpuStat(uint32_t pid)
 {
     cpu_stat cpu_data{0};
-    ProcStatFile procStatFile(0);
-    cpu_data.user = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::USER).c_str());
-    cpu_data.nice = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::NICE).c_str());
-    cpu_data.system = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::SYSTEM).c_str());
-    cpu_data.idle = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::IDLE).c_str());
-    if (pid != 0)
+    ProcStatFile procStatFile;
+    if (procStatFile.GetLastError() != AbstractFile::Result::ERROR)
     {
-        procStatFile.~ProcStatFile();
-        new (&procStatFile) ProcStatFile(pid);
-        cpu_data.utime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::UTIME).c_str());
-        cpu_data.stime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::STIME).c_str());
-        cpu_data.cutime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::CUTIME).c_str());
-        cpu_data.cstime = atol(procStatFile.GetEntryValue(ProcStatFile::Entry::CSTIME).c_str());
+        std::string data;
+        AbstractFile::Result res = procStatFile.GetEntryValue(ProcStatFile::Entry::USER, data);
+        if (res == AbstractFile::Result::ERROR)
+        {
+            // log << Error while getting entry for pid << std::endl;
+            return cpu_stat{0};
+        }
+        cpu_data.user = atol(data.c_str());
+
+        res = procStatFile.GetEntryValue(ProcStatFile::Entry::NICE, data);
+        if (res == AbstractFile::Result::ERROR)
+        {
+            // log << Error while getting entry for pid << std::endl;
+            return cpu_stat{0};
+        }
+        cpu_data.nice = atol(data.c_str());
+
+        res = procStatFile.GetEntryValue(ProcStatFile::Entry::SYSTEM, data);
+        if (res == AbstractFile::Result::ERROR)
+        {
+            // log << Error while getting entry for pid << std::endl;
+            return cpu_stat{0};
+        }
+        cpu_data.system = atol(data.c_str());
+
+        res = procStatFile.GetEntryValue(ProcStatFile::Entry::IDLE, data);
+        if (res == AbstractFile::Result::ERROR)
+        {
+            // log << Error while getting entry for pid << std::endl;
+            return cpu_stat{0};
+        }
+        cpu_data.idle = atol(data.c_str());
+
+        if (pid != 0)
+        {
+            ProcStatFile pidProcStatFile(pid);
+            if (pidProcStatFile.GetLastError() != AbstractFile::Result::ERROR)
+            {
+                // file has been readed succesfully
+
+                res = pidProcStatFile.GetEntryValue(ProcStatFile::Entry::UTIME, data);
+                if (res == AbstractFile::Result::ERROR)
+                {
+                    // log << Error while getting entry for pid << std::endl;
+                    return cpu_stat{0};
+                }
+                cpu_data.utime = atol(data.c_str());
+
+                res = pidProcStatFile.GetEntryValue(ProcStatFile::Entry::STIME, data);
+                if (res == AbstractFile::Result::ERROR)
+                {
+                    // log << Error while getting entry for pid << std::endl;
+                    return cpu_stat{0};
+                }
+                cpu_data.stime = atol(data.c_str());
+
+                res = pidProcStatFile.GetEntryValue(ProcStatFile::Entry::CUTIME, data);
+                if (res == AbstractFile::Result::ERROR)
+                {
+                    // log << Error while getting entry for pid << std::endl;
+                    return cpu_stat{0};
+                }
+                cpu_data.cutime = atol(data.c_str());
+
+                res = pidProcStatFile.GetEntryValue(ProcStatFile::Entry::CSTIME, data);
+                if (res == AbstractFile::Result::ERROR)
+                {
+                    // log << Error while getting entry for pid << std::endl;
+                    return cpu_stat{0};
+                }
+                cpu_data.cstime = atol(data.c_str());
+            }
+            else
+            {
+                // file hasn't been readed
+
+                //  log << File was not readed << endl;
+                return cpu_stat{0};
+            }
+        }
     }
+    else
+    {
+        // file hasn't been readed
+
+        // log << file was not readed << endl;
+        return cpu_stat{0};
+    }
+
     return cpu_data;
 }
 
@@ -430,14 +517,61 @@ ram_stat Collector::RamStat(uint32_t pid)
 {
     ram_stat ram_data{0};
     ProcMemInfoFile procMemInfoFile;
-    ram_data.ram_available = atol(procMemInfoFile.GetEntryValue(ProcMemInfoFile::Entry::MEM_AVAILABLE).c_str());
-    ram_data.ram_total = atol(procMemInfoFile.GetEntryValue(ProcMemInfoFile::Entry::MEM_TOTAL).c_str());
-    if (pid != 0)
+
+    if (procMemInfoFile.GetLastError() != AbstractFile::Result::ERROR)
     {
-        ProcStatusFile procStatusFile(pid);
-        ram_data.vmrss = atol(procStatusFile.GetEntryValue(ProcStatusFile::Entry::VMRSS).c_str());
-        ram_data.pid = pid;
+        // file has been readed succesfully
+        std::string data;
+        AbstractFile::Result result;
+
+        result = procMemInfoFile.GetEntryValue(ProcMemInfoFile::Entry::MEM_AVAILABLE, data);
+        if (result == AbstractFile::Result::ERROR)
+        {
+            // Error getting entry value
+            return ram_stat{0};
+        }
+        ram_data.ram_available = atol(data.c_str());
+
+        result = procMemInfoFile.GetEntryValue(ProcMemInfoFile::Entry::MEM_TOTAL, data);
+        if (result == AbstractFile::Result::ERROR)
+        {
+            // Error getting entry value
+            return ram_stat{0};
+        }
+        ram_data.ram_total = atol(data.c_str());
+
+        if (pid != 0)
+        {
+            ProcStatusFile procStatusFile(pid);
+
+            if (procStatusFile.GetLastError() != AbstractFile::Result::ERROR)
+            {
+                // File has been readed
+                result = procStatusFile.GetEntryValue(ProcStatusFile::Entry::VMRSS, data);
+                if (result == AbstractFile::Result::ERROR)
+                {
+                    // Error getting entry value
+                    return ram_stat{0};
+                }
+                ram_data.vmrss = atol(data.c_str());
+
+                ram_data.pid = pid;
+            }
+            else
+            {
+                // file hasn't been readed
+                // Log << "Error while reading procStatusFile for pid" << pid << endl;
+                return ram_stat{0};
+            }
+        }
     }
+    else
+    {
+        // file hasn't been readed
+        // Log << "Error while reading procStatusFile for pid" << pid << endl;
+        return ram_stat{0};
+    }
+
     return ram_data;
 }
 
@@ -447,8 +581,28 @@ net_stat Collector::NetStat(uint32_t pid)
     for (auto active_net_interface : GetActiveNetworkInterfaces())
     {
         ProcNetDevFile procNetDevFile(pid);
-        net_data.r_bytes += atoll(procNetDevFile.GetEntryValue(active_net_interface, ProcNetDevFile::Entry::RECV_BYTES).c_str());
-        net_data.w_bytes += atoll(procNetDevFile.GetEntryValue(active_net_interface, ProcNetDevFile::Entry::WRITE_BYTES).c_str());
+        if (procNetDevFile.GetLastError() != AbstractFile::Result::ERROR)
+        {
+            // File has been readed successfully
+            AbstractFile::Result result;
+            std::string data;
+
+            result = procNetDevFile.GetEntryValue(active_net_interface, ProcNetDevFile::Entry::RECV_BYTES, data);
+            if (result == AbstractFile::Result::ERROR)
+            {
+                // Error getting entry value
+                return net_stat{0};
+            }
+            net_data.r_bytes += atoll(data.c_str());
+
+            result = procNetDevFile.GetEntryValue(active_net_interface, ProcNetDevFile::Entry::WRITE_BYTES, data);
+            if (result == AbstractFile::Result::ERROR)
+            {
+                // Error getting entry value
+                return net_stat{0};
+            }
+            net_data.w_bytes += atoll(data.c_str());
+        }
     }
     if (pid != 0)
     {
@@ -462,35 +616,88 @@ bd_stat Collector::BdStat(uint32_t pid)
     bd_stat bd_data{0};
     if (pid == 0)
     {
-        for (auto active_bd : GetActiveBlockDevices())
+        SysBlockStatFile sysBlockStatFile;
+        if (sysBlockStatFile.GetLastError() != AbstractFile::Result::ERROR)
         {
-            bd_data.r_bytes += atoll(SysBlockStatFile().GetEntryValue(active_bd, SysBlockStatFile::Entry::READ_SECTORS).c_str());
-            bd_data.w_bytes += atoll(SysBlockStatFile().GetEntryValue(active_bd, SysBlockStatFile::Entry::WRITE_SECTORS).c_str());
-            bd_data.r_bytes *= GetBlockDeviceSectorSize(active_bd);
-            bd_data.w_bytes *= GetBlockDeviceSectorSize(active_bd);
+            AbstractFile::Result result;
+            std::string data;
+            for (auto active_bd : GetActiveBlockDevices())
+            {
+                result = sysBlockStatFile.GetEntryValue(active_bd, SysBlockStatFile::Entry::READ_SECTORS, data);
+                if (result == AbstractFile::Result::ERROR)
+                {
+                    // Error getting entry value
+                    return bd_stat{0};
+                }
+                bd_data.r_bytes += atoll(data.c_str());
+
+                result = sysBlockStatFile.GetEntryValue(active_bd, SysBlockStatFile::Entry::WRITE_SECTORS, data);
+                if (result == AbstractFile::Result::ERROR)
+                {
+                    // Error getting entry value
+                    // log << error cause << endl;
+                    return bd_stat{0};
+                }
+                bd_data.w_bytes += atoll(data.c_str());
+
+                bd_data.r_bytes *= GetBlockDeviceSectorSize(active_bd);
+                bd_data.w_bytes *= GetBlockDeviceSectorSize(active_bd);
+            }
+        }
+        else
+        {
+            // Error while reading file
+            // log << error cause << endl;
+            return bd_stat{0};
         }
     }
 
     else
     {
-        bd_data.r_bytes += atoll(ProcPidIoFile(pid).GetEntryValue(ProcPidIoFile::Entry::RCHAR).c_str());
-        bd_data.w_bytes += atoll(ProcPidIoFile(pid).GetEntryValue(ProcPidIoFile::Entry::WCHAR).c_str());
-        bd_data.pid = pid;
+        ProcPidIoFile procPidIoFile(pid);
+        if (procPidIoFile.GetLastError() != AbstractFile::Result::ERROR)
+        {
+            AbstractFile::Result result;
+            std::string data;
+
+            result = procPidIoFile.GetEntryValue(ProcPidIoFile::Entry::RCHAR, data);
+            if (result == AbstractFile::Result::ERROR)
+            {
+                // Error getting entry value
+                // log << error cause << endl;
+                return bd_stat{0};
+            }
+            bd_data.r_bytes += atoll(data.c_str());
+
+            result = procPidIoFile.GetEntryValue(ProcPidIoFile::Entry::WCHAR, data);
+            if (result == AbstractFile::Result::ERROR)
+            {
+                // Error getting entry value
+                // log << error cause << endl;
+                return bd_stat{0};
+            }
+            bd_data.w_bytes += atoll(data.c_str());
+            bd_data.pid = pid;
+        }
+        else
+        {
+            // Error while reading file
+            // log << error cause << endl;
+            return bd_stat{0};
+        }
     }
     return bd_data;
 }
 
 // ===== Calculator =====
-Calculator Calculate()
-{
-    return Calculator();
-}
 
 uint32_t Calculator::GeneralCpuUsage(cpu_stat early_cpu_data, cpu_stat lately_cpu_data)
 {
     uint32_t result = 0;
-    if (lately_cpu_data.user < early_cpu_data.user || lately_cpu_data.nice < early_cpu_data.nice ||
-        lately_cpu_data.system < early_cpu_data.system || lately_cpu_data.idle < early_cpu_data.idle)
+    if (lately_cpu_data.user < early_cpu_data.user ||
+        lately_cpu_data.nice < early_cpu_data.nice ||
+        lately_cpu_data.system < early_cpu_data.system ||
+        lately_cpu_data.idle < early_cpu_data.idle)
     {
         // Overflow detection. Just skip this value.
         return result;
@@ -528,14 +735,6 @@ uint32_t Calculator::CpuUsage(cpu_stat early_cpu_data, cpu_stat lately_cpu_data)
     return result;
 }
 
-uint32_t Calculator::GeneralRamUsage(ram_stat ram_data)
-{
-    uint32_t occupied_ram = ram_data.ram_total - ram_data.ram_available;
-    occupied_ram *= 100;
-    occupied_ram /= ram_data.ram_total;
-    return occupied_ram;
-}
-
 uint32_t Calculator::RamUsage(ram_stat ram_data)
 {
     uint32_t occupied_ram;
@@ -552,18 +751,19 @@ uint32_t Calculator::RamUsage(ram_stat ram_data)
     return occupied_ram;
 }
 
-uint32_t Calculator::GeneralRamUsage_m(ram_stat ram_data)
-{
-    uint32_t occupied_ram = ram_data.ram_total - ram_data.ram_available;
-    // occupied_ram /= 1024;
-    return ToMB(occupied_ram * 1024); // kbytes > bytes
-}
-
 uint32_t Calculator::RamUsage_m(ram_stat ram_data)
 {
-    uint32_t occupied_ram = ram_data.vmrss;
-    occupied_ram /= 1024;
-    return occupied_ram;
+    uint64_t occupied_ram;
+    if (ram_data.pid != 0)
+    {
+        occupied_ram = ram_data.vmrss;
+    }
+    else
+    {
+        occupied_ram = ram_data.ram_total - ram_data.ram_available;
+    }
+    occupied_ram *= 1024; // kbytes -> bytes
+    return ToMB(occupied_ram);
 }
 
 uint32_t Calculator::NetDownload(net_stat early_net_data, net_stat lately_net_data)
@@ -585,6 +785,8 @@ uint32_t Calculator::BlockDeviceRead(bd_stat early_bd_data, bd_stat lately_bd_da
 {
     return lately_bd_data.r_bytes - early_bd_data.r_bytes;
 }
+
+// ===== Rb_metrics =====
 
 uint32_t Rb_metrics::GetGeneralCpuUsage()
 {
@@ -626,14 +828,14 @@ std::pair<uint64_t, uint64_t> Rb_metrics::GetNetUsage()
     return getNetUsage(m_pid);
 }
 
-std::pair<uint64_t, uint64_t> Rb_metrics::GetGeneralIoStats()
+std::pair<uint64_t, uint64_t> Rb_metrics::GetGeneralIoStat()
 {
-    return getIoStats();
+    return getIostat();
 }
 
-std::pair<uint64_t, uint64_t> Rb_metrics::GetIoStats()
+std::pair<uint64_t, uint64_t> Rb_metrics::GetIoStat()
 {
-    return getIoStats(m_pid);
+    return getIostat(m_pid);
 }
 
 uint32_t Rb_metrics::getCpuUsage(unsigned int pid) // = 0
@@ -643,13 +845,14 @@ uint32_t Rb_metrics::getCpuUsage(unsigned int pid) // = 0
         // Log >> <pid> does not exist
         return 0;
     }
-    auto early_cpu_data = Collect().CpuStat(pid);
+    auto early_cpu_data = Collector().CpuStat(pid);
     std::this_thread::sleep_for(std::chrono::seconds(m_period));
-    auto lately_cpu_data = Collect().CpuStat(pid);
-    if (pid == 0) {
-        return Calculate().GeneralCpuUsage(early_cpu_data, lately_cpu_data);
+    auto lately_cpu_data = Collector().CpuStat(pid);
+    if (pid == 0)
+    {
+        return Calculator().GeneralCpuUsage(early_cpu_data, lately_cpu_data);
     }
-    return Calculate().CpuUsage(early_cpu_data, lately_cpu_data);
+    return Calculator().CpuUsage(early_cpu_data, lately_cpu_data);
 }
 
 uint32_t Rb_metrics::getRamUsage(unsigned int pid) // = 0
@@ -659,8 +862,16 @@ uint32_t Rb_metrics::getRamUsage(unsigned int pid) // = 0
         // Log >> <pid> does not exist
         return 0;
     }
-    auto ram_data = Collect().RamStat(pid);
-    return Calculate().RamUsage(ram_data);
+    auto ram_data = Collector().RamStat(pid);
+    if (pid != 0)
+    {
+        for (auto child : getAllChildren(pid))
+        {
+            auto child_ram_data = Collector().RamStat(child);
+            ram_data.vmrss += child_ram_data.vmrss;
+        }
+    }
+    return Calculator().RamUsage(ram_data);
 }
 
 uint32_t Rb_metrics::getRamUsage_m(uint32_t pid) // = 0
@@ -670,29 +881,73 @@ uint32_t Rb_metrics::getRamUsage_m(uint32_t pid) // = 0
         // Log >> <pid> does not exist
         return 0;
     }
-    auto ram_data = Collect().RamStat(pid);
-    return ToMB(Calculate().RamUsage(ram_data) * 1024); // kb >> bytes
+    auto ram_data = Collector().RamStat(pid);
+    if (pid != 0)
+    {
+        for (auto child : getAllChildren(pid))
+        {
+            auto child_ram_data = Collector().RamStat(child);
+            ram_data.vmrss += child_ram_data.vmrss;
+        }
+    }
+    return Calculator().RamUsage_m(ram_data);
 }
 
 std::pair<uint64_t, uint64_t> Rb_metrics::getNetUsage(uint32_t pid) // = 0
 {
     std::pair<uint64_t, uint64_t> result;
-    auto early_network_usage_data = Collect().NetStat(pid);
+    auto early_network_usage_data = Collector().NetStat(pid);
+    if (pid != 0)
+    {
+        for (auto child : getAllChildren(pid))
+        {
+            auto child_network_data = Collector().NetStat(child);
+            early_network_usage_data.r_bytes += child_network_data.r_bytes;
+            early_network_usage_data.w_bytes += child_network_data.w_bytes;
+        }
+    }
     std::this_thread::sleep_for(std::chrono::seconds(m_period));
-    auto lately_network_usage_data = Collect().NetStat(pid);
-    result.first = ToKB(Calculate().NetDownload(early_network_usage_data, lately_network_usage_data));
-    result.second = ToKB(Calculate().NetUpload(early_network_usage_data, lately_network_usage_data));
+    auto lately_network_usage_data = Collector().NetStat(pid);
+    if (pid != 0)
+    {
+        for (auto child : getAllChildren(pid))
+        {
+            auto child_network_data = Collector().NetStat(child);
+            lately_network_usage_data.r_bytes += child_network_data.r_bytes;
+            lately_network_usage_data.w_bytes += child_network_data.w_bytes;
+        }
+    }
+    result.first = ToKB(Calculator().NetDownload(early_network_usage_data, lately_network_usage_data));
+    result.second = ToKB(Calculator().NetUpload(early_network_usage_data, lately_network_usage_data));
     return result;
 }
 
-std::pair<uint64_t, uint64_t> Rb_metrics::getIoStats(uint32_t pid) // = 0
+std::pair<uint64_t, uint64_t> Rb_metrics::getIostat(uint32_t pid) // = 0
 {
     std::pair<uint64_t, uint64_t> result;
-    auto early_bd_usage_data = Collect().BdStat(pid);
+    auto early_bd_usage_data = Collector().BdStat(pid);
+    if (pid != 0)
+    {
+        for (auto child : getAllChildren(pid))
+        {
+            auto child_bd_data = Collector().BdStat(child);
+            early_bd_usage_data.r_bytes += child_bd_data.r_bytes;
+            early_bd_usage_data.w_bytes += child_bd_data.w_bytes;
+        }
+    }
     std::this_thread::sleep_for(std::chrono::milliseconds(m_period));
-    auto lately_bd_usage_data = Collect().BdStat(pid);
-    result.first = ToKB(Calculate().BlockDeviceRead(early_bd_usage_data, lately_bd_usage_data));
-    result.second = ToKB(Calculate().BlockDeviceWrite(early_bd_usage_data, lately_bd_usage_data));
+    auto lately_bd_usage_data = Collector().BdStat(pid);
+    if (pid != 0)
+    {
+        for (auto child : getAllChildren(pid))
+        {
+            auto child_bd_data = Collector().BdStat(child);
+            lately_bd_usage_data.r_bytes += child_bd_data.r_bytes;
+            lately_bd_usage_data.w_bytes += child_bd_data.w_bytes;
+        }
+    }
+    result.first = ToKB(Calculator().BlockDeviceRead(early_bd_usage_data, lately_bd_usage_data));
+    result.second = ToKB(Calculator().BlockDeviceWrite(early_bd_usage_data, lately_bd_usage_data));
     return result;
 }
 

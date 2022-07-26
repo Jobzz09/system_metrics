@@ -19,12 +19,22 @@ public:
 
     };
 
-    std::string GetEntryValue(Entry entry);
+    enum class Result {
+        SUCCESS = 0,
+        ERROR = 1
+    };
+
+    Result GetLastError();
+
+    // Return entry of the file
+    Result GetEntryValue(Entry entry, std::string& result);
 
 protected:
     std::vector<std::string> fileContent;
 
-    virtual bool ReadFile(std::string filePath);
+    virtual Result ReadFile(std::string&& filePath);
+
+    Result last_error = Result::SUCCESS;
 };
 
 class ProcStatFile : public AbstractFile
@@ -39,12 +49,13 @@ public:
         UTIME = 13,
         STIME = 14,
         CUTIME = 15,
-        CSTIME = 16
+        CSTIME = 16,
+        PPID = 3
     };
 
     ProcStatFile(uint32_t pid = 0);
 
-    std::string GetEntryValue(Entry entry);
+    Result GetEntryValue(Entry entry, std::string& dst_string);
 };
 
 class ProcStatusFile : public AbstractFile
@@ -52,13 +63,13 @@ class ProcStatusFile : public AbstractFile
 public:
     enum class Entry
     {
-        VMRSS = 73,
+        VMRSS = 65,
         PPID = 14
     };
 
     ProcStatusFile(uint32_t pid);
 
-    std::string GetEntryValue(Entry entry);
+    Result GetEntryValue(Entry entry, std::string& dst_string);
 };
 
 class ProcMemInfoFile : public AbstractFile
@@ -72,7 +83,7 @@ public:
 
     ProcMemInfoFile(uint32_t pid = 0);
 
-    std::string GetEntryValue(Entry entry);
+    Result GetEntryValue(Entry entry, std::string& dst_string);
 };
 
 class ProcNetDevFile : public AbstractFile
@@ -86,11 +97,10 @@ public:
 
     ProcNetDevFile(uint32_t pid = 0);
 
-    std::string GetEntryValue(std::string interface_name, Entry entry);
+    Result GetEntryValue(const std::string& interface_name, Entry entry, std::string& dst_string);
 
 private:
-
-    bool ReadFile(std::string filePath) override; 
+    Result ReadFile(std::string&& filePath) override;
     std::map<std::string, std::vector<std::string>> line_content_for_device;
 };
 
@@ -103,7 +113,7 @@ public:
         WRITE_SECTORS = 6
     };
 
-    std::string GetEntryValue(std::string block_device, Entry entry);
+    Result GetEntryValue(const std::string& block_device, Entry entry, std::string& dst_string);
 
     SysBlockStatFile(uint32_t pid = 0);
 
@@ -122,7 +132,7 @@ public:
 
     ProcPidIoFile(uint32_t pid);
 
-    std::string GetEntryValue(Entry entry);
+    Result GetEntryValue(Entry entry, std::string& dst_string);
 };
 
 struct cpu_stat
@@ -188,10 +198,6 @@ public:
     uint32_t BlockDeviceRead(bd_stat early_bd_data, bd_stat lately_bd_data);
 };
 
-
-
-
-
 class Rb_metrics
 {
 public:
@@ -231,10 +237,10 @@ public:
     // Block devices
 
     // Returns general io statistics in kilobytes(read, write) over the period
-    std::pair<uint64_t, uint64_t> GetGeneralIoStats();
+    std::pair<uint64_t, uint64_t> GetGeneralIoStat();
 
     // Returns process and its children's general io statistics in kilobytes(read, write) over the period
-    std::pair<uint64_t, uint64_t> GetIoStats();
+    std::pair<uint64_t, uint64_t> GetIoStat();
 
 private:
     // Returns cpu usage percentage over the period(m_period)
@@ -250,7 +256,7 @@ private:
     std::pair<uint64_t, uint64_t> getNetUsage(uint32_t pid = 0);
 
     // Returns IO usage (pair of (uint32_t readed, uint32_t written)) in kilobytes over the period(m_period)
-    std::pair<uint64_t, uint64_t> getIoStats(uint32_t pid = 0);
+    std::pair<uint64_t, uint64_t> getIostat(uint32_t pid = 0);
 
     // Returns all children of the current pid(m_pid)
     std::vector<uint32_t> getAllChildren(uint32_t pid);
